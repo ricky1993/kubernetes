@@ -41,6 +41,7 @@ import (
 	"k8s.io/apiserver/pkg/storage"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/cache"
+	api "k8s.io/kubernetes/pkg/apis/core"
 	utiltrace "k8s.io/utils/trace"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -100,6 +101,8 @@ type Config struct {
 	NewListFunc func() runtime.Object
 
 	Codec runtime.Codec
+
+	RejectListFromNode bool
 }
 
 type watchersMap map[int]*cacheWatcher
@@ -284,6 +287,8 @@ type Cacher struct {
 	bookmarkWatchers *watcherBookmarkTimeBuckets
 	// watchBookmark feature-gate
 	watchBookmarkEnabled bool
+	// rejectListFromNode is used to protect etcd before initialization
+	rejectListFromNode bool
 }
 
 // NewCacherFromConfig creates a new Cacher responsible for servicing WATCH and LIST requests from
@@ -324,6 +329,8 @@ func NewCacherFromConfig(config Config) *Cacher {
 		timer:                time.NewTimer(time.Duration(0)),
 		bookmarkWatchers:     newTimeBucketWatchers(clock),
 		watchBookmarkEnabled: utilfeature.DefaultFeatureGate.Enabled(features.WatchBookmark),
+
+		rejectListFromNode: config.RejectListFromNode,
 	}
 
 	// Ensure that timer is stopped.
@@ -636,6 +643,9 @@ func (c *Cacher) List(ctx context.Context, key string, resourceVersion string, p
 	}
 
 	if listRV == 0 && !c.ready.check() {
+		if c.rejectListFromNode && isRequestFromNode(pred) {
+			return fmt.Errorf("waiting for cache ready")
+		}
 		// If Cacher is not yet initialized and we don't require any specific
 		// minimal resource version, simply forward the request to storage.
 		return c.storage.List(ctx, key, resourceVersion, pred, listObj)
@@ -1271,4 +1281,14 @@ func (r *ready) set(ok bool) {
 	defer r.c.L.Unlock()
 	r.ok = ok
 	r.c.Broadcast()
+}
+
+// kubelet only watches pods assigned onto it, generally we believe this is the most possible way to
+// distinguish kubelet requests from others
+func isRequestFromNode(pred storage.SelectionPredicate) bool {
+	if pred.Field.Empty() {
+		return false
+	}
+	_, ok := pred.Field.RequiresExactMatch(api.PodHostField)
+	return ok
 }
